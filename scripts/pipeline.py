@@ -5,7 +5,7 @@
 分批只用于控制显存与 prompt 构造的内存，不落任何中间文件。
 
 用法：
-    python scripts/pipeline.py --dataset TOXICN --limit 20        # 冒烟：只跑前 20 条
+    python scripts/pipeline.py --dataset TOXICN --limit 500      # 冒烟：前 500 条（跨批，>batch_samples）
     python scripts/pipeline.py --dataset TOXICN                   # 全量
     python scripts/pipeline.py --dataset TOXICN --stages audit
     python scripts/pipeline.py --dataset TOXICN --model_path D:/ncbm_ds4.1f/models/glm-4-9b-chat
@@ -83,6 +83,9 @@ def resolve_model(hint: str, explicit: str | None = None) -> Path:
 
 def load_concepts(path: Path) -> list[dict]:
     """读取词典。文件带 UTF-8 BOM，必须用 utf-8-sig。"""
+    path = Path(path)
+    if not path.exists():
+        raise SystemExit(f"[error] 词典不存在：{path}\n        项目根目录：{C.ROOT}")
     with open(path, encoding="utf-8-sig", newline="") as f:
         rows = list(csv.DictReader(f))
     out = []
@@ -111,7 +114,7 @@ def load_records(dataset: str, split: str) -> list[dict]:
     spec = C.DATASET_FILES[dataset]
     path = Path(spec[split])
     if not path.exists():
-        raise SystemExit(f"[error] 数据文件不存在：{path}")
+        raise SystemExit(f"[error] 数据文件不存在：{path}\n        项目根目录：{C.ROOT}")
     records = json.loads(path.read_text(encoding="utf-8"))
     for i, r in enumerate(records):
         r["_idx"] = i
@@ -203,8 +206,15 @@ def state_tokens(concept: dict) -> list[list[str]]:
 
 
 def prep_text(record: dict, dataset: str, max_chars: int) -> str:
-    """取文本并按打标时的规则截断；打标与落盘必须用同一份文本，否则 json 无法复现。"""
-    t = (record.get(C.DATASET_FILES[dataset]["text_key"]) or "").strip()
+    """取文本并按打标时的规则截断；打标与落盘必须用同一份文本，否则 json 无法复现。
+
+    必须判类型：COLD/train 里有 1 条 content 是 NaN（float），
+    `(nan or "").strip()` 不会走 `or` 分支（NaN 是 truthy），会直接抛 AttributeError。
+    """
+    t = record.get(C.DATASET_FILES[dataset]["text_key"])
+    if not isinstance(t, str):
+        return ""
+    t = t.strip()
     return t[:max_chars] if len(t) > max_chars else t
 
 
@@ -449,10 +459,13 @@ def stage_annotate(dataset: str, split: str, limit: int | None, model_path: str 
         print(f"[info] 按此速度，全量 {n_all} 条约需 {eta / 60:.0f} min（不含模型加载）")
 
     spec = C.DATASET_FILES[dataset]
+    extra_keys = C.EXTRA_FIELDS.get(dataset, [])
     samples = [{
         "idx": r["_idx"],
         "text": prep_text(r, dataset, max_chars),
         "label": int(r.get(spec["label_key"], 0)),
+        # 原样保留分层所需字段（TOXICN 的 expression/toxic_type/topic）
+        **{k: r[k] for k in extra_keys if k in r},
     } for r in records]
 
     out_path = write_json(out_dir, dataset, split, concepts, model_dir, samples, labels, conf)
@@ -477,6 +490,7 @@ def write_json(out_dir: Path, dataset: str, split: str, concepts: list[dict],
             "missing": "-1 表示候选字均未进入 top-k",
         },
         "llm": str(model_dir),
+        "max_text_chars": C.ANNOTATE["max_text_chars"],   # 文本按此截断，json 里的 text 与实际送入模型的一致
         "concept_csv_mtime": Path(C.CONCEPT_CSV).stat().st_mtime,
         "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
@@ -491,13 +505,12 @@ def write_json(out_dir: Path, dataset: str, split: str, concepts: list[dict],
         f.write(json.dumps(concepts_out, ensure_ascii=False))
         f.write(',\n"samples": [\n')
         for i, s in enumerate(samples):
-            rec = {
-                "idx": int(s["idx"]),
-                "text": s["text"],
-                "label": int(s["label"]),
-                "labels": labels[i].tolist(),
-                "conf": [round(float(v), 3) for v in conf[i]],
-            }
+            rec = {"idx": int(s["idx"]), "text": s["text"], "label": int(s["label"])}
+            for k, v in s.items():          # expression / toxic_type / topic 等分层字段
+                if k not in ("idx", "text", "label"):
+                    rec[k] = v
+            rec["labels"] = labels[i].tolist()
+            rec["conf"] = [round(float(v), 3) for v in conf[i]]
             f.write(json.dumps(rec, ensure_ascii=False))
             f.write(",\n" if i < len(samples) - 1 else "\n")
         f.write("]\n}\n")
@@ -544,8 +557,17 @@ def stage_audit(dataset: str, split: str):
     for j, c in enumerate(concepts):
         present[:, j] = is_present(c["domain"], labels[:, j]).astype(np.int8)
 
-    with np.errstate(invalid="ignore", divide="ignore"):
-        corr = np.nan_to_num(np.corrcoef(present.T), nan=0.0)
+    # 共线只用"无缺失"的样本：把 -1 当成"不出现"去算相关系数，会把相关系统性压低
+    complete = (labels >= 0).all(axis=1)
+    n_complete = int(complete.sum())
+    if n_complete >= 2:
+        with np.errstate(invalid="ignore", divide="ignore"):
+            corr = np.nan_to_num(np.corrcoef(present[complete].T), nan=0.0)
+        if n_complete < n:
+            print(f"[info] 共线分析用 {n_complete}/{n} 条无缺失样本")
+    else:
+        corr = np.zeros((k, k))
+        print("[warn] 无缺失样本不足 2 条，共线分析跳过")
 
     rows = []
     for j, c in enumerate(concepts):
@@ -573,8 +595,11 @@ def stage_audit(dataset: str, split: str):
         flags = []
         if miss / n > 0.05:
             flags.append("缺失率高")
-        if rate < 0.01:
-            flags.append("正例<1%")
+        # ternary 的"否认"是有效信号：断言和否认都几乎为 0 才是死维度。
+        # 只看断言会把"高否认率"的概念误判为死维度，而否认正是隐式样本的核心信号。
+        deny_rate = dist.get("否认", 0.0) if c["domain"] == "ternary" else 0.0
+        if rate < 0.01 and deny_rate < 0.01:
+            flags.append("死维度")
         if mean_conf < 0.6:
             flags.append("置信低")
         if mi_norm > 0.9:
@@ -608,7 +633,7 @@ def stage_audit(dataset: str, split: str):
     dims = sum(2 if c["domain"] == "ternary" else 1 for c in concepts if c["in_bottleneck"])
     print("\n======== 质检摘要 ========")
     print(f"样本 {n}，概念 {k}，当前瓶颈维度 {dims}")
-    for flag in ("正例<1%", "置信低", "缺失率高", "近标签代理", "高共线"):
+    for flag in ("死维度", "置信低", "缺失率高", "近标签代理", "高共线"):
         hit = [r["id"] for r in rows if flag in r["flags"]]
         print(f"{flag:>8}({len(hit)}): {hit or '无'}")
     print(f"明细：{out_csv}")
@@ -632,6 +657,7 @@ def main():
     if unknown:
         raise SystemExit(f"[error] 未知阶段 {unknown}，可选 annotate / audit")
 
+    print(f"[info] 项目根目录：{C.ROOT}")
     for s in stages:
         print(f"\n===== stage: {s} ({a.dataset}/{a.split}) =====")
         if s == "annotate":

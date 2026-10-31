@@ -2,34 +2,50 @@
 """CRBM 流水线配置。
 
 所有路径均指向本地，禁止任何远程下载。
+路径写法约定：根目录由本文件位置推出，其余一律写"相对于根目录"的路径，
+不在任何地方写盘符或绝对路径 —— 换机器、换盘符、换挂载点都不用改代码。
 """
 
 from pathlib import Path
 
-ROOT = Path(r"D:\ncbm_ds4.1f")
+# configs/ 的上一级就是项目根目录
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def rel(rel_path: str) -> Path:
+    """相对根目录的路径 → 绝对路径。"""
+    return ROOT / rel_path
+
 
 # ---------------- 概念词典 ----------------
-CONCEPT_CSV = ROOT / "data" / "concepts" / "cbm_concept_set_v2.csv"
+CONCEPT_CSV = rel("data/concepts/cbm_concept_set_v2.csv")
 
 # ---------------- 原始数据 ----------------
-DATA_RAW = ROOT / "data" / "raw"
+DATA_RAW = rel("data/raw")
 DATASET_FILES = {
     "TOXICN": {
-        "train": DATA_RAW / "TOXICN" / "train.json",
-        "test":  DATA_RAW / "TOXICN" / "test.json",
+        "train": rel("data/raw/TOXICN/train.json"),
+        "test":  rel("data/raw/TOXICN/test.json"),
         "text_key": "content",
         "label_key": "toxic",
     },
     "COLD": {
-        "train": DATA_RAW / "COLD" / "train.json",
-        "test":  DATA_RAW / "COLD" / "test.json",
+        "train": rel("data/raw/COLD/train.json"),
+        "test":  rel("data/raw/COLD/test.json"),
         "text_key": "content",
         "label_key": "toxic",
     },
 }
 
+# 每条样本额外保留的原始字段：主张 B 要按"显式/隐式"分层评估，
+# 分层依据只能是数据集自带的标注，所以必须随标签一起落盘，后续阶段不必回读 data/raw。
+EXTRA_FIELDS = {
+    "TOXICN": ["expression", "toxic_type", "topic"],
+    "COLD": ["topic"],
+}
+
 # ---------------- 本地模型 ----------------
-MODELS_DIR = ROOT / "models"
+MODELS_DIR = rel("models")
 LLM_HINT = "glm-4-9b"              # 概念标注用，models/ 下按关键字匹配
 ENCODER_HINT = "chinese-roberta"   # M1 概念层编码器（可换 macbert 等）
 
@@ -64,5 +80,5 @@ ANNOTATE = {
 }
 
 # ---------------- 产物 ----------------
-PROCESSED = ROOT / "data" / "processed"
-EXPERIMENTS = ROOT / "experiments"
+PROCESSED = rel("data/processed")
+EXPERIMENTS = rel("experiments")
